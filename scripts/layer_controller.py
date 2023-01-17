@@ -44,6 +44,8 @@ class DebugDownBlockAdapter(object):
       x = torch.lerp(last_x, x, current_block_weight)
     if self.parent_unet_adapter.get_enable_analysis():
       self.parent_unet_adapter.add_temp_state(x)
+    if self.parent_unet_adapter.shadowing and self.parent_unet_adapter.shadowX is not None:
+      self.parent_unet_adapter.shadowX = self.op(self.parent_unet_adapter.shadowX)
     result_x = self.op(x)
     
 
@@ -68,12 +70,27 @@ class DebugUpBlockAdapter(object):
     assert x.shape[1] == self.channels
     current_block_weight, last_x = self.parent_unet_adapter.get_block_weight_info_suite()
     if current_block_weight != 1:
-      x = torch.lerp(last_x, x, current_block_weight)
+      if self.parent_unet_adapter.shadowing:
+        if self.parent_unet_adapter.shadowX is None:
+          self.parent_unet_adapter.shadowX = torch.lerp(last_x, x, current_block_weight)
+        else:
+          self.parent_unet_adapter.shadowX = self.parent_unet_adapter.shadowX + torch.lerp(last_x, x, current_block_weight) - last_x
+      else:
+        x = torch.lerp(last_x, x, current_block_weight)
+    else:
+      if self.parent_unet_adapter.shadowX is not None:
+        self.parent_unet_adapter.shadowX = self.parent_unet_adapter.shadowX + x - last_x
     if self.parent_unet_adapter.get_enable_analysis():
       if self.parent_unet_adapter.get_delta_analysis_flag():
         self.parent_unet_adapter.add_temp_state(x - last_x)
       else:
         self.parent_unet_adapter.add_temp_state(x)
+    if self.parent_unet_adapter.shadowing and self.parent_unet_adapter.shadowX is not None:
+      self.parent_unet_adapter.shadowX = self.ori_fwd_calc(self.parent_unet_adapter.shadowX)
+    x = self.ori_fwd_calc(x)
+    return x
+  
+  def ori_fwd_calc(self, x):
     if self.dims == 3:
         x = F.interpolate(
             x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
@@ -82,7 +99,7 @@ class DebugUpBlockAdapter(object):
         x = F.interpolate(x, scale_factor=2, mode="nearest")
     if self.use_conv:
         x = self.conv(x)
-    return x
+    return x    
 
 class DebugResBlockAdapter(object):
   def __init__(self, org_module: torch.nn.Module = None,parent_unet_adapter = None):
@@ -100,6 +117,14 @@ class DebugResBlockAdapter(object):
 
     self.org_module._forward = self._forward
   def _forward(self, x, emb):
+    out_x = self.ori__forward_calc(x,emb)
+    self.parent_unet_adapter.set_last_x(out_x)
+    if self.parent_unet_adapter.shadowing and self.parent_unet_adapter.shadowX is not None:
+      self.parent_unet_adapter.shadowX = self.ori__forward_calc(self.parent_unet_adapter.shadowXdownFeed if self.parent_unet_adapter.shadowXdownFeed is not None else self.parent_unet_adapter.shadowX,emb)
+    print(f'ResBlock {self.channels} to {self.out_channels} channels')
+    return out_x
+  
+  def ori__forward_calc(self, x, emb):
     if self.updown:
         in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
         h = in_rest(x)
@@ -120,8 +145,6 @@ class DebugResBlockAdapter(object):
         h = h + emb_out
         h = self.out_layers(h)
     result = self.skip_connection(x) + h
-    self.parent_unet_adapter.set_last_x(result)
-    print(f'ResBlock {self.channels} to {self.out_channels} channels')
     return result
 
 
@@ -139,6 +162,9 @@ class DebugUNetAdapter(object):
     self.enable_analysis = False
     self.delta_analysis = False
     self.cycle_counter = -1
+    self.shadowing = False
+    self.shadowX = None
+    self.shadowXdownFeed = None
 
   def __str__(self):
       return "Debug " + str(self.org_module)
@@ -159,6 +185,8 @@ class DebugUNetAdapter(object):
     for state_variable in self.temp_states:
       del state_variable
     del self.temp_states
+    del self.shadowX
+    del self.shadowXdownFeed
 
 
     self.step_records = []
@@ -167,7 +195,8 @@ class DebugUNetAdapter(object):
     
     self.current_layer_idx = 0
     self.cycle_counter = -1
-
+    self.shadowX = None
+    self.shadowXdownFeed = None
   
   def get_final_results(self):
     # self.step_records.append(self.temp_states)
@@ -193,6 +222,12 @@ class DebugUNetAdapter(object):
 
   def set_last_x(self, new_last_x):
     self.last_x = new_last_x
+  
+  def set_shadowing(self, new_shadowing_flag):
+    self.shadowing = new_shadowing_flag
+
+  def get_shadowing(self):
+    return self.shadowing
 
   def set_enable_analysis(self, new_analysis_flag):
     self.enable_analysis = new_analysis_flag
@@ -251,7 +286,16 @@ class DebugUNetAdapter(object):
             if self.enable_weight_control:
               current_layer_weight = self.layer_weight_list[self.current_layer_idx]
               if current_layer_weight != 1:
-                h = torch.lerp(self.last_x, h, current_layer_weight)
+                if self.shadowing:
+                  if self.shadowX is None:
+                    self.shadowX = torch.lerp(self.last_x, h, current_layer_weight)
+                  else:
+                    self.shadowX = self.shadowX + torch.lerp(self.last_x, h, current_layer_weight) - self.last_x
+                else:
+                  h = torch.lerp(self.last_x, h, current_layer_weight)
+              else:
+                if self.shadowX is not None:
+                  self.shadowX = self.shadowX + h-self.last_x
                 # print(f'layer {self.current_layer_idx} applying linear weight {current_layer_weight}')
             if self.enable_analysis:
               if self.delta_analysis:
@@ -274,7 +318,16 @@ class DebugUNetAdapter(object):
       if self.enable_weight_control:
         current_layer_weight = self.layer_weight_list[self.current_layer_idx]
         if current_layer_weight != 1:
-          h = torch.lerp(self.last_x, h, current_layer_weight)
+          if self.shadowing:
+            if self.shadowX is None:
+              self.shadowX = torch.lerp(self.last_x, h, current_layer_weight)
+            else:
+              self.shadowX = self.shadowX + torch.lerp(self.last_x, h, current_layer_weight) - self.last_x
+          else:
+            h = torch.lerp(self.last_x, h, current_layer_weight)
+        else:
+          if self.shadowX is not None:
+            self.shadowX = self.shadowX + h-self.last_x
       print(f'mid block {self.last_x.shape} to {h.shape}')
       if self.enable_analysis:
         if self.delta_analysis:
@@ -286,13 +339,24 @@ class DebugUNetAdapter(object):
 
       for module in self.output_blocks:
           self.last_x = h
+          if self.shadowX is not None:
+            self.shadowXdownFeed = torch.cat([self.shadowX, hs[-1]], dim=1)
           h = torch.cat([h, hs.pop()], dim=1)
           h = module(h, emb, context)
           if h.shape == self.last_x.shape:
             if self.enable_weight_control:
               current_layer_weight = self.layer_weight_list[self.current_layer_idx]
               if current_layer_weight != 1:
-                h = torch.lerp(self.last_x, h, current_layer_weight)
+                if self.shadowing:
+                  if self.shadowX is None:
+                    self.shadowX = torch.lerp(self.last_x, h, current_layer_weight)
+                  else:
+                    self.shadowX = self.shadowX + torch.lerp(self.last_x, h, current_layer_weight) - self.last_x
+                else:
+                  h = torch.lerp(self.last_x, h, current_layer_weight)
+              else:
+                if self.shadowX is not None:
+                  self.shadowX = self.shadowX + h-self.last_x
                 # print('!!!!')
                 # print(f'layer {self.current_layer_idx} applying linear weight {current_layer_weight}')
             if self.enable_analysis:
@@ -305,6 +369,12 @@ class DebugUNetAdapter(object):
             print(f'up block {self.last_x.shape} to {h.shape}')
           
           self.current_layer_idx += 1
+
+      if self.shadowing and self.shadowX is not None:
+        h = self.shadowX
+        self.shadowX = None
+        del self.shadowXdownFeed
+        self.shadowXdownFeed = None
       h = h.type(x.dtype)
       if self.enable_analysis:
         if self.cycle_counter == 0:
@@ -405,6 +475,7 @@ class Script(scripts.Script):
       with gr.Accordion('LayerController', open=False):
         enabled = gr.Checkbox(label='Enable', value=False)
         analysis_enabled = gr.Checkbox(label='Enable Layer Analysis (Warning: High VRAM Usage)', value=False)
+        shadowing_enabled = gr.Checkbox(label='Enable Layer Shadowing (Warning: Additional VRAM and CPU usage is expected after diverging block)', value=False)
         # block_default_weight = gr.Slider(label="Block Default Weight", value=1, minimum=-1.0, maximum=2.0, step=.01, interactive=False)
         config_textbox = gr.Textbox(
                 value="",
@@ -413,11 +484,12 @@ class Script(scripts.Script):
                 interactive=False,
                 visible=False
               )
-        ctrls.extend((enabled,analysis_enabled,config_textbox))
+        ctrls.extend((enabled,analysis_enabled,shadowing_enabled,config_textbox))
         self.enabled_checkbox = enabled
         self.infotext_fields.extend([
           (enabled, "LayerControl Enabled"),
-          (config_textbox,"LayerControl Config")
+          (config_textbox,"LayerControl Config"),
+          (shadowing_enabled, "Layer Shadowing")
         ])
 
         
@@ -547,7 +619,7 @@ class Script(scripts.Script):
         analyze_button.click(analyze_result_func, inputs=None, outputs=self.analysis_image_displays)
         ctrls.append(analyze_button)
 
-        def update_weights(enabled_flag, *weights):
+        def update_weights(enabled_flag,shadowing_enabled_flag,  *weights):
           if not shared.unetAdapter.check_unet():
             unet = shared.sd_model.model.diffusion_model
             shared.unetAdapter.set_unet(unet)
@@ -558,6 +630,8 @@ class Script(scripts.Script):
             shared.unetAdapter.set_weight([])
             # self.current_weight_vals = []
             return
+          shared.unetAdapter.set_shadowing(shadowing_enabled_flag)
+          
           
           # self.current_weight_vals = weight_list
 
@@ -574,7 +648,7 @@ class Script(scripts.Script):
         def config_text_weight_slider_update(config_text):
           if config_text == '':
             return ['',*self.slider_weight_list]
-          config_text = config_text[:100]
+          config_text = config_text[:300]
           config_text = config_text.replace('\\','')
           config_text = config_text.strip("\"")
           # full_config = '{' + config_text + '}'
@@ -606,13 +680,17 @@ class Script(scripts.Script):
 
 
         for slider in self.weight_sliders:
-          slider.change(update_weights, inputs=[enabled, *self.weight_sliders], outputs=None)
+          slider.change(update_weights, inputs=[enabled, shadowing_enabled, *self.weight_sliders], outputs=None)
 
-        enabled.change(update_weights, inputs=[enabled, *self.weight_sliders], outputs=None)
+        enabled.change(update_weights, inputs=[enabled, shadowing_enabled, *self.weight_sliders], outputs=None)
         def update_analysis_flag(new_analysis_flag):
           shared.unetAdapter.set_enable_analysis(new_analysis_flag)
 
+        def update_shadowing(new_shadowing_flag):
+          shared.unetAdapter.set_shadowing(new_shadowing_flag)
+
         analysis_enabled.change(update_analysis_flag, inputs=[analysis_enabled],outputs=None)
+        shadowing_enabled.change(update_shadowing, inputs=[shadowing_enabled],outputs=None)
         config_textbox.change(config_text_weight_slider_update, inputs=[config_textbox], outputs=[config_textbox,*self.weight_sliders])
         # block_default_weight.update(iniitialize_default_weights, inputs=[block_default_weight], outputs=self.weight_sliders)
 
@@ -635,6 +713,7 @@ class Script(scripts.Script):
     new_config_text = json.dumps(new_config_dict)
     # new_config_text = new_config_text.strip(r'{}')
     added_param_texts["LayerControl Config"] = new_config_text
+    added_param_texts["Layer Shadowing"] = shared.unetAdapter.get_shadowing()
     
     p.extra_generation_params.update(added_param_texts)
 
